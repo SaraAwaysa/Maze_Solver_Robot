@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robot PID Code</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; }
+        pre { background: #222; color: #fff; padding: 10px; border-radius: 5px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>Robot PID Code</h1>
+    <pre>
+        // Your code will be displayed here
+        #include <Wire.h>
+        #include <MPU6050.h>
+        
+        // Motor control definitions
+        #define ENA 14  
+        #define IN1 25  
+        #define IN2 26  
+        
+        MPU6050 mpu;
+        void setup() {
+            Serial.begin(115200);
+            Wire.begin();
+            mpu.initialize();
+        }
+        
+        void loop() {
+            // Robot movement logic
+        }
+    </pre>
+</body>
+</html>
