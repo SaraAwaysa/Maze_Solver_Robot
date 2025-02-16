@@ -1,0 +1,1429 @@
+
+#include <Wire.h>
+#include <queue>  // For priority queue
+#include <vector>
+#include <VL53L0X.h>  // Include the VL53L0X library
+#include <MPU6050.h>
+#define LIDAR_I2C_ADDRESS 0x29 // Default I2C address of VL53L0X
+# define ENA 14  // PWM for left motor speed
+# define ENB 32  // PWM for right motor speed
+# define IN1 25  // Left motor direction pin 1
+# define IN2 26  // Left motor direction pin 2
+# define IN3 27  // Right motor direction pin 1
+# define IN4 33  // Right motor direction pin 2
+VL53L0X lidar;
+MPU6050 mpu;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// for move forward
+// PID variables
+float Kp = 2.7;  // أقل قليلًا
+float Ki = 0.0;  // تجنب التراكم
+float Kd = 2;  // زيادة التأثير التفاضلي
+
+float error, previousError = 0;
+float integral = 0, derivative;
+float controlSignal;
+unsigned long previousTime, currentTime;
+
+int16_t gz;
+long previous_time;
+float yaw_angle = 0;
+float gyro_z_offset = 0;
+int calibration_count = 2000;
+
+// Target yaw angle (should be 0 for straight movement)
+int targetYawAngle = 0;
+
+// Duration to move backward for approximately 10 cm (adjust experimentally)
+unsigned long travelTime = 1000;  // 1000 ms (example value)
+
+////////////////////////////////
+//for rotate with pid 
+
+
+float proportionalGain = 2.5;
+float integralGain = 0.0;
+float derivativeGain = 2;
+
+float yawError, previousYawError = 0;
+float integralTerm = 0, derivativeTerm;
+float pidOutput;
+unsigned long lastTime;
+
+int16_t gyroZ;
+long lastUpdateTime;
+float yawAngle = 0;
+float gyroZOffset = 0;
+int calibrationSamples = 2000;
+
+// Target yaw angle (90 degrees for turning)
+int desiredYawAngle = 90;
+int desiredYawAngleleft = -90;
+
+
+
+////////////////////////////////////////
+/////////for floodfill
+const int mazeSize = 4;
+unsigned long startupTime = 0;  // Variable to store time of startup
+
+
+
+int mazevalues[mazeSize][mazeSize]= {
+        {3,  2,  1,  2},
+        {2,  1,  0,  1},
+        {3, 2, 1, 2},
+        {4  , 3, 2, 3}
+    };  // Manhattan distance matrix
+
+int visited[mazeSize][mazeSize] = {0};  // Track visited cells
+int mazewalls[mazeSize][mazeSize]={255};
+int inqueue[mazeSize][mazeSize]={0};
+
+int IR_LEFT = 23;
+int IR_RIGHT = 13;
+
+// Struct to represent a cell in the maze
+struct Cell {
+    int y, x;  // x, y coordinates position
+};
+
+std::queue<Cell> qtofindminneighbour;
+// Enum to track direction
+enum Direction { NORTH, EAST, SOUTH, WEST };
+Direction directions[4] = {NORTH, EAST, SOUTH, WEST};
+Direction currentDirection = NORTH; //Initialization
+ 
+Cell currentposition={3,0};
+
+
+/////////////////////////////////////////////////////////////////////
+// Function to generate the Manhattan distance matrix
+void generateManhattanMatrix() {
+    int center1 = mazeSize / 2;
+    int center2 = center1 - 1;
+
+    for (int i = 0; i < mazeSize; i++) {
+        for (int j = 0; j < mazeSize; j++) {
+            int dist1 = abs(i - center1) + abs(j - center1);
+            int dist2 = abs(i - center1) + abs(j - center2);
+            int dist3 = abs(i - center2) + abs(j - center1);
+            int dist4 = abs(i - center2) + abs(j - center2);
+
+            mazevalues[i][j] = min(min(dist1, dist2), min(dist3, dist4));
+        }
+    }
+}
+
+int readLeftIRsensor() {
+        Serial.println("call left sensor");
+
+    int read = digitalRead(IR_LEFT);
+read = !read;  
+    
+    Serial.print("IR Left: ");  // Use Serial.print() instead of println() for labels
+    Serial.println(read);  // This will print the value on a new line
+    return read;
+}
+
+int readRightIRsensor() {
+        Serial.println("call right sensor");
+
+    int read = digitalRead(IR_RIGHT);
+    read = !read;  
+    Serial.println("IR Right: ");
+    Serial.println(read);
+    return read;
+}
+
+
+int readLidarSensor() {
+    Serial.println("Call readLidarSensor");
+    int distance_mm = lidar.readRangeSingleMillimeters();  
+
+    if (lidar.timeoutOccurred()) {
+        Serial.println("LiDAR timeout!");
+        return -1;  
+    }
+    int distance_cm = distance_mm / 10;
+    Serial.print("LiDAR Distance: ");
+    Serial.print(distance_cm);
+    Serial.println(" cm");
+
+    if (distance_cm <= 20) {
+        Serial.println("Object detected at 20 cm or less, returning 1");
+        return 1;  
+    } else {
+        return 0;  
+    }
+}
+
+
+
+void getSurrounds(int y, int x, int &x_N, int &y_N, int &x_E, int &y_E, int &x_S, int &y_S, int &x_W, int &y_W) {
+  Serial.print("call getsurrounds");
+    
+    switch (currentDirection) {
+        case NORTH:
+            x_N = x; y_N = y - 1;
+            x_E = x + 1; y_E = y;
+            x_S = x; y_S = y + 1;
+            x_W = x - 1; y_W = y;
+            break;
+
+        case EAST:
+            x_N = x+1; y_N = y ; 
+            x_E = x ; y_E = y+1;
+            x_S = x-1; y_S = y; 
+            x_W = x ; y_W = y-1;
+            break;
+
+        case SOUTH:
+            x_N = x; y_N = y + 1;
+            x_E = x -1; y_E = y;
+            x_S = x; y_S = y -1;
+            x_W = x + 1; y_W = y;
+            break;
+
+        case WEST:
+            x_N = x-1; y_N = y ;
+            x_E = x ; y_E = y-1;
+            x_S = x+1; y_S = y ;
+            x_W = x; y_W = y+1;
+            break;
+    }
+
+    
+    if (y_N < 0||y_N >= mazeSize) y_N = -1;
+    if (x_N < 0||x_N >= mazeSize) x_N = -1;
+    if (x_E < 0||x_E >= mazeSize) x_E = -1;
+    if (y_E < 0||y_E >= mazeSize) y_E = -1;
+    if (y_W < 0||y_W >= mazeSize) y_W = -1;
+    if (x_W < 0||x_W >= mazeSize) x_W = -1;
+    if (y_S < 0||y_S >= mazeSize) y_S = -1;
+    if (x_S < 0||x_S >= mazeSize) x_S = -1;
+  
+
+}
+
+void detectwall(int L,int R,int F,int x,int y){
+        Serial.println("call detect wall");
+
+    switch (currentDirection) {
+        case NORTH:
+          if (L==1&&R==1&&F==1){
+            mazewalls[x][y]=13;
+          } if (L==1&&R==1&&F==0){
+            mazewalls[x][y]=11;
+          } if (L==1&&R==0&&F==1){
+            mazewalls[x][y]=8;
+          } if (L==0&&R==1&&F==1){
+            mazewalls[x][y]=7;
+          } if (L==1&&R==0&&F==0){
+            mazewalls[x][y]=1;
+          } if (L==0&&R==0&&F==1){
+            mazewalls[x][y]=2;
+          } if (L==0&&R==1&&F==0){
+            mazewalls[x][y]=3;
+          } if (L==0&&R==0&&F==0){
+            mazewalls[x][y]=15;
+          } break; 
+
+        case EAST:
+          if (L==1&&R==1&&F==1){
+            mazewalls[x][y]=12;
+          } if (L==1&&R==1&&F==0){
+            mazewalls[x][y]=10;
+          } if (L==1&&R==0&&F==1){
+            mazewalls[x][y]=7;
+          } if (L==0&&R==1&&F==1){
+            mazewalls[x][y]=6;
+          } if (L==1&&R==0&&F==0){
+            mazewalls[x][y]=2;
+          } if (L==0&&R==0&&F==1){
+            mazewalls[x][y]=3;
+          } if (L==0&&R==1&&F==0){
+            mazewalls[x][y]=4;
+          } if (L==0&&R==0&&F==0){
+            mazewalls[x][y]=15;
+          } break; 
+        
+        case SOUTH:
+          if (L==1&&R==1&&F==1){
+            mazewalls[x][y]=17; //////////////// 17 for U
+          } if (L==1&&R==1&&F==0){
+            mazewalls[x][y]=11;
+          } if (L==1&&R==0&&F==1){
+            mazewalls[x][y]=6;
+          } if (L==0&&R==1&&F==1){
+            mazewalls[x][y]=5;
+          } if (L==1&&R==0&&F==0){
+            mazewalls[x][y]=3;
+          } if (L==0&&R==0&&F==1){
+            mazewalls[x][y]=4;
+          } if (L==0&&R==1&&F==0){
+            mazewalls[x][y]=1;
+          } if (L==0&&R==0&&F==0){
+            mazewalls[x][y]=15;
+          } break;
+
+        case WEST:
+          if (L==1&&R==1&&F==1){
+            mazewalls[x][y]=14;
+          } if (L==1&&R==1&&F==0){
+            mazewalls[x][y]=10;
+          } if (L==1&&R==0&&F==1){
+            mazewalls[x][y]=5;
+          } if (L==0&&R==1&&F==1){
+            mazewalls[x][y]=8;
+          } if (L==1&&R==0&&F==0){
+            mazewalls[x][y]=4;
+          } if (L==0&&R==0&&F==1){
+            mazewalls[x][y]=1;
+          } if (L==0&&R==1&&F==0){
+            mazewalls[x][y]=2;
+          } if (L==0&&R==0&&F==0){
+            mazewalls[x][y]=15;
+          } break;  
+    }
+
+
+
+}
+
+
+// Determine accessible nodes from the current cell
+int getAccessibleNodes(int y, int x) {
+  Serial.println("call get accessable");
+    int x_N, y_N, x_E, y_E, x_S, y_S, x_W, y_W;
+    getSurrounds(y, x, x_N, y_N, x_E, y_E, x_S, y_S, x_W, y_W);
+
+    int leftDetection = readLeftIRsensor();
+    int rightDetection = readRightIRsensor();
+    int frontDetection = readLidarSensor();
+
+    detectwall(leftDetection,rightDetection,frontDetection,x,y);
+
+    int accessibleNodes = 0;
+    if (!frontDetection && y_N != -1 && x_N !=-1) accessibleNodes |= (1 << 0);  // North
+    if (!rightDetection && y_E != -1 &&  x_E !=-1) accessibleNodes |= (1 << 1);  // East
+    accessibleNodes |= (1 << 2);  // South
+    if (!leftDetection && y_W != -1 &&  x_W !=-1) accessibleNodes |= (1 << 3);   // West
+
+    Serial.println(accessibleNodes);
+
+    return accessibleNodes;
+}
+
+// Get the next cell based on the current direction
+Cell getNextCell(Cell pos,Direction  tempDirection) {
+          Serial.println("call get next cell");
+    int y = pos.y;
+    int x = pos.x;
+    
+
+     switch (tempDirection) {
+        case NORTH:
+             if ( currentDirection== NORTH) y--;
+            else if (currentDirection == EAST) x++;
+            else if (currentDirection == SOUTH) y++;
+            else if (currentDirection == WEST) x--;
+            break;
+
+        case EAST:
+            if ( currentDirection== NORTH) x++;
+            else if (currentDirection == EAST) y++;
+            else if (currentDirection == SOUTH) x--;
+            else if (currentDirection == WEST) y--;
+            break;
+
+        case SOUTH:
+            if ( currentDirection== NORTH) y++;
+            else if (currentDirection == EAST) x--;
+            else if (currentDirection == SOUTH) y--;
+            else if (currentDirection == WEST) x++;
+            break;
+
+        case WEST:
+            if ( currentDirection== NORTH) x--;
+            else if (currentDirection == EAST) y--;
+            else if (currentDirection == SOUTH) x++;
+            else if (currentDirection == WEST) y++;
+            break;
+    }
+
+     if (y < 0||y >= mazeSize) y = -1;
+     if (x < 0||x >= mazeSize) x = -1;
+   
+    
+    return {y, x};
+}
+void turnLeft() {
+    Serial.println("Executing rotateLeft90");
+
+    yawAngle = 0;  // Reset yaw before turn
+    unsigned long startTime = millis();  // Prevent infinite loop
+
+    while (abs(yawAngle) < desiredYawAngle - 20) {
+        if (millis() - startTime > 3000) {  // 3-second failsafe
+            Serial.println("Timeout! Stopping turn.");
+            break;
+        }
+
+        long currentMillis = millis();
+        float elapsedTime = (currentMillis - lastUpdateTime) / 1000.0;
+        lastUpdateTime = currentMillis;
+
+        gyroZ = mpu.getRotationZ();
+        gyroZ -= gyroZOffset;
+        float gyroZRate = gyroZ / 131.0;
+
+        yawAngle += gyroZRate * elapsedTime;
+
+        Serial.print("Yaw Angle: ");  // Debugging yaw angle
+        Serial.println(yawAngle);
+
+        yawError = desiredYawAngle - yawAngle;
+        integralTerm += yawError * (currentMillis - lastTime);
+        derivativeTerm = (yawError - previousYawError) / (currentMillis - lastTime);
+
+        pidOutput = proportionalGain * yawError + integralGain * integralTerm + derivativeGain * derivativeTerm;
+
+        int baseSpeed = 90;
+        int leftMotorSpeed = baseSpeed - pidOutput;
+        int rightMotorSpeed = baseSpeed + pidOutput;
+
+        leftMotorSpeed = constrain(leftMotorSpeed, 0, 120);
+        rightMotorSpeed = constrain(rightMotorSpeed, 0, 120);
+
+        moveMotors(leftMotorSpeed, rightMotorSpeed);
+
+        previousYawError = yawError;
+        lastTime = currentMillis;
+    }
+
+    haltMotors();  
+    yawAngle = 0;
+}
+
+void moveMotors(int leftSpeed, int rightSpeed) {
+    analogWrite(ENA, leftSpeed);
+    analogWrite(ENB, rightSpeed);
+
+    digitalWrite(IN1, LOW);   // Left motor moves backward
+    digitalWrite(IN2, HIGH);
+
+    digitalWrite(IN3, LOW);  // Right motor moves backward
+    digitalWrite(IN4, HIGH);
+}
+
+
+void turnRight() {
+ Serial.println("Executing rotateRight90");
+
+    // Reset the yaw angle before starting the turn
+    yawAngle = 0;
+
+    unsigned long startTime = millis();  // Record the start time
+
+    while (abs(yawAngle) < desiredYawAngle - 1) {
+        long currentMillis = millis();
+        currentTime = millis();
+        float elapsedTime = (currentMillis - lastUpdateTime) / 1000.0;
+        lastUpdateTime = currentMillis;
+
+        // Read Z-axis rotation (gyro)
+        gyroZ = mpu.getRotationZ();
+        gyroZ -= gyroZOffset;
+        float gyroZRate = gyroZ / 131.0;
+
+        // Integrate the gyro to get the yaw angle
+        yawAngle += gyroZRate * elapsedTime;
+
+        // Calculate error relative to the target angle
+        yawError = desiredYawAngle - yawAngle;
+        integralTerm += yawError * (currentTime - lastTime);
+        derivativeTerm = (yawError - previousYawError) / (currentTime - lastTime);
+
+        // Compute PID output
+        pidOutput = proportionalGain * yawError + integralGain * integralTerm + derivativeGain * derivativeTerm;
+
+        int baseSpeed = 90;  // Adjust base speed as needed
+        int leftMotorSpeed = baseSpeed + pidOutput;  // Left motor should move forward
+        int rightMotorSpeed = baseSpeed - pidOutput;  // Right motor should move backward
+
+        // Ensure speeds stay within range (0-255)
+        leftMotorSpeed = constrain(leftMotorSpeed, 0, 120);
+        rightMotorSpeed = constrain(rightMotorSpeed, 0, 120);
+
+        // Set motor speeds to rotate the robot right
+        driveMotors(leftMotorSpeed, rightMotorSpeed);
+
+        // Update previous PID values
+        previousYawError = yawError;
+        lastTime = currentTime;
+    }
+
+    haltMotors();  // Stop motors after completing the turn
+    yawAngle = 0;  // إعادة تعيين زاوية اللفة بعد التيرن
+
+}
+
+// ------------- FUNCTION TO MOVE MOTORS ---------------- //
+void driveMotors(int leftSpeed, int rightSpeed) {
+    // Set motor speeds
+    analogWrite(ENA, leftSpeed);
+    analogWrite(ENB, rightSpeed);
+
+    // Set motor directions for rotating right
+    digitalWrite(IN1, LOW);   // Left motor moves forward
+    digitalWrite(IN2, HIGH);
+
+    digitalWrite(IN3, HIGH);  // Right motor moves backward
+    digitalWrite(IN4, LOW);
+}
+
+// ------------- FUNCTION TO STOP MOTORS ---------------- //
+void haltMotors() {
+    analogWrite(ENA, 0);
+    analogWrite(ENB, 0);
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+}
+
+
+void uTurn(int leftSpeed, int rightSpeed, int duration) {
+    Serial.println("call uturn");
+    analogWrite(ENA, leftSpeed);
+    analogWrite(ENB, rightSpeed);
+
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);  
+    digitalWrite(IN4, HIGH);
+
+    delay(duration);  
+    stopMotors();  
+}
+
+void stopMotors() {
+    analogWrite(ENA, 0);
+    analogWrite(ENB, 0);
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+}
+
+
+
+
+void moveForward(int distance_cm, int travelTime) {
+    Serial.println("call moveForward");
+
+    unsigned long startTime = millis();  // Record the start time
+    int baseSpeed = 80;  // Base speed for the motors (adjust as necessary)
+    
+    while (millis() - startTime < travelTime) {  // Keep moving forward for calculated duration
+        long current_time = millis();
+        currentTime = millis();
+        float elapsed_time = (current_time - previous_time) / 1000.0;
+        previous_time = current_time;
+
+        // Read Z-axis rotation (gyro data)
+        gz = mpu.getRotationZ();
+        gz -= gyro_z_offset;
+        float gyro_z = gz / 131.0;
+
+        // Calculate angle using integration
+        yaw_angle += gyro_z * elapsed_time;
+
+        // Calculate error relative to the target angle
+        error = yaw_angle - targetYawAngle;
+        integral += error * (currentTime - previousTime);
+        derivative = (error - previousError) / (currentTime - previousTime);
+
+        // Compute PID output
+        controlSignal = Kp * error + Ki * integral + Kd * derivative;
+
+        // Adjust motor speeds using controlSignal
+        int leftMotorSpeed = baseSpeed + controlSignal;
+        int rightMotorSpeed = baseSpeed - controlSignal;
+
+        // Ensure motor speeds are within valid range
+        leftMotorSpeed = constrain(leftMotorSpeed, 0, 90);  // Adjust max speed if needed
+        rightMotorSpeed = constrain(rightMotorSpeed, 0, 90);
+
+        // Move robot forward with PID correction
+        moveBackward(leftMotorSpeed, rightMotorSpeed);
+
+        // Update previous PID values
+        previousError = error;
+        previousTime = currentTime;
+    }
+    
+    stopMotors();  // Stop motors after moving the required distance
+    error = 0;
+    previousError = 0;
+    integral = 0;
+    derivative = 0;
+    controlSignal = 0;
+    yaw_angle = 0;
+    delay(100);  // Small delay to ensure the motors stop smoothly
+    return;
+}
+
+
+
+// ------------- FUNCTION TO MOVE BACKWARD ---------------- //
+void moveBackward(int leftSpeed, int rightSpeed) {
+
+    // Set motor speeds
+    analogWrite(ENA, leftSpeed);
+    analogWrite(ENB, rightSpeed);
+
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+}
+
+// ------------- FUNCTION TO STOP MOTORS ---------------- //
+
+
+// ------------- FUNCTION TO CALIBRATE GYRO ---------------- //
+void calculateGyroDrift() {
+      Serial.println("call calculateGyroDrift");
+
+    for (int i = 0; i < calibration_count; i++) {
+        gz = mpu.getRotationZ();
+        gyro_z_offset += gz;
+        delay(2);
+    }
+    gyro_z_offset /= calibration_count;
+}
+
+void callneighbours(Cell pos, std::queue<Cell>& q) {
+          Serial.println("call callneighbours");
+
+    // Nort
+    int y=pos.y;
+    int x=pos.x;
+
+
+    if (visited[y][x]==1)
+    {
+      if (mazewalls[y][x]==1||mazewalls[y][x]==3||mazewalls[y][x]==4||mazewalls[y][x]==6||mazewalls[y][x]==5||mazewalls[y][x]==9||mazewalls[y][x]==11||mazewalls[y][x]==15||mazewalls[y][x]==17)
+      {
+        Cell north = {pos.y - 1, pos.x};
+        qtofindminneighbour.push(north);
+        if (inqueue[north.y][north.x]==0)
+        {
+        q.push(north);
+        inqueue[north.y][north.x]=1;
+        }
+      }
+      
+      if(mazewalls[y][x]==1||mazewalls[y][x]==2||mazewalls[y][x]==4||mazewalls[y][x]==5||mazewalls[y][x]==8||mazewalls[y][x]==10||mazewalls[y][x]==14||mazewalls[y][x]==15)
+      {
+        Cell east = {pos.y , pos.x+1};
+        if (inqueue[east.y][east.x]==0)
+        {
+          q.push(east);
+          qtofindminneighbour.push(east);
+          inqueue[east.y][east.x]=1;
+        }
+      }
+
+      if(mazewalls[y][x]==2||mazewalls[y][x]==3||mazewalls[y][x]==4||mazewalls[y][x]==6||mazewalls[y][x]==7||mazewalls[y][x]==10||mazewalls[y][x]==12||mazewalls[y][x]==15)
+      {
+         Cell west = {pos.y , pos.x-1};
+        qtofindminneighbour.push(west);
+        if (inqueue[west.y][west.x]==0)
+        {
+          q.push(west);
+          inqueue[west.y][west.x]=1;
+        }
+      }
+
+       if(mazewalls[y][x]==1||mazewalls[y][x]==2||mazewalls[y][x]==3||mazewalls[y][x]==7||mazewalls[y][x]==8||mazewalls[y][x]==9||mazewalls[y][x]==11||mazewalls[y][x]==13||mazewalls[y][x]==15)
+       {
+          Cell south = {pos.y+1 , pos.x};
+          qtofindminneighbour.push(south);
+          if (inqueue[south.y][south.x]==0)
+        {
+          q.push(south);
+           inqueue[south.y][south.x]=1;
+        }
+
+       }
+
+    }
+
+      else if (visited[y][x]==0)
+      {
+        Cell north = {pos.y - 1, pos.x};
+        if (north.y>=0){
+          qtofindminneighbour.push(north);
+           if (inqueue[north.y][north.x]==0)
+        {
+          q.push(north);
+           inqueue[north.y][north.x]=1;
+        } 
+        }
+        
+        Cell east = {pos.y , pos.x+1};
+        if (east.x < mazeSize){
+          qtofindminneighbour.push(east);
+          if (inqueue[east.y][east.x]==0){
+          q.push(east);
+          inqueue[east.y][east.x]=1;}
+        }
+        
+        Cell west = {pos.y , pos.x-1};
+        if (west.x>=0){if (inqueue[west.y][west.x]==0){
+          q.push(west);
+          inqueue[west.y][west.x]=1;
+          }
+          qtofindminneighbour.push(west);
+        }
+
+        Cell south = {pos.y+1 , pos.x};
+        if (south.y <mazeSize){if (inqueue[south.y][south.x]==0){
+          q.push(south);
+          inqueue[south.y][south.x]=1;
+
+          }
+          qtofindminneighbour.push(south);
+        }
+      }
+}
+
+int minhusristicneighbour()
+{
+        Serial.println("call minhurisic");
+
+  int min=255;
+   while (!qtofindminneighbour.empty()) {
+           Cell temp=qtofindminneighbour.front();
+           qtofindminneighbour.pop();
+           if (mazevalues[temp.y][temp.x]<min)
+             min=mazevalues[temp.y][temp.x];
+  
+   }
+
+   return min;           
+}
+
+
+void floodfill(Cell pos) {
+    Serial.println("call floodfill");
+    Cell nextMove=pos;
+    Cell temp;
+    int minhuristic=255;
+    std::queue<Cell> q;
+    q.push(pos);
+    inqueue[pos.y][pos.x]=1;
+    int accessibleNodes = getAccessibleNodes(pos.y, pos.x);
+
+    if (currentDirection == NORTH) {
+      if (accessibleNodes & (1 << 0)) { // North///
+        temp = getNextCell(pos, NORTH);
+        if (temp.y != -1 && temp.x != -1) {
+          minhuristic = mazevalues[temp.y][temp.x];
+          nextMove = temp;
+          Serial.print("north : (");
+          Serial.print(temp.y);
+          Serial.print(", ");
+          Serial.print(temp.x);
+          Serial.println(")");
+        }
+      }
+    
+
+      if (accessibleNodes & (1 << 1)) { // EAST
+        temp = getNextCell(pos, EAST);
+          if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+            if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+              minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+              nextMove = temp;  // Update nextMove to the new valid position
+              Serial.print("east : (");
+              Serial.print(temp.y);
+              Serial.print(", ");
+              Serial.print(temp.x);
+              Serial.println(")");
+            }   
+          }
+      }
+
+      if (accessibleNodes & (1 << 2)) { // SOUTH
+        temp = getNextCell(pos, SOUTH);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("south : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+
+      if (accessibleNodes & (1 << 3)) { // WEST
+        temp = getNextCell(pos, WEST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+              Serial.print("west : (");
+              Serial.print(temp.y);
+              Serial.print(", ");
+              Serial.print(temp.x);
+              Serial.println(")");
+          }
+        }
+      }
+    
+    }else if (currentDirection == EAST) {
+
+      if (accessibleNodes & (1 << 3)) { // WEST
+        temp = getNextCell(pos, WEST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("west : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }  
+      }
+
+      if (accessibleNodes & (1 << 0)) { // North///
+        temp = getNextCell(pos, NORTH);
+        if (temp.y != -1 && temp.x != -1) {
+          if (mazevalues[temp.y][temp.x] < minhuristic) {
+            minhuristic = mazevalues[temp.y][temp.x];
+            nextMove = temp;
+            Serial.print("north : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+      if (accessibleNodes & (1 << 1)) { // EAST
+        temp = getNextCell(pos, EAST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("east : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+      if (accessibleNodes & (1 << 2)) { // SOUTH
+        temp = getNextCell(pos, SOUTH);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("south : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+    }
+
+    else if (currentDirection == WEST)
+    {
+
+      if (accessibleNodes & (1 << 1)) { // EAST
+        temp = getNextCell(pos, EAST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("east : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+        }
+      }
+
+       
+      if (accessibleNodes & (1 << 2)) { // SOUTH
+        temp = getNextCell(pos, SOUTH);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("south : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+      if (accessibleNodes & (1 << 3)) { // WEST
+        temp = getNextCell(pos, WEST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("west : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+      if (accessibleNodes & (1 << 0)) { // North///
+        temp = getNextCell(pos, NORTH);
+        if (temp.y != -1 && temp.x != -1) {
+          if (mazevalues[temp.y][temp.x] < minhuristic) { 
+            minhuristic = mazevalues[temp.y][temp.x];
+            nextMove = temp;
+            Serial.print("north : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+    } 
+    else if (currentDirection == SOUTH) {
+      if (accessibleNodes & (1 << 2)) { // SOUTH
+        temp = getNextCell(pos, SOUTH);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("south : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+        }
+      }
+
+      if (accessibleNodes & (1 << 3)) { // WEST
+        temp = getNextCell(pos, WEST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("west : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+      if (accessibleNodes & (1 << 0)) { // North///
+        temp = getNextCell(pos, NORTH);
+        if (temp.y != -1 && temp.x != -1) {
+          if (mazevalues[temp.y][temp.x] < minhuristic) {
+            minhuristic = mazevalues[temp.y][temp.x];
+            nextMove = temp;
+            Serial.print("north : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+    
+      if (accessibleNodes & (1 << 1)) { // EAST
+        temp = getNextCell(pos, EAST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("east : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+       }
+
+    }
+
+
+    if ( mazevalues[pos.y][pos.x]-1!=mazevalues[nextMove.y][nextMove.x])
+    {
+      Serial.println("start change huristic");
+        while (!q.empty()) {
+           temp=q.front();
+           q.pop();
+           inqueue[pos.y][pos.x]=0;
+           callneighbours(temp, q);
+           int minneighbour=minhusristicneighbour();
+           if (mazevalues[temp.y][temp.x]-1!=minneighbour)
+           {
+             mazevalues[temp.y][temp.x]=minneighbour+1;
+          
+           }
+           
+        }
+
+      int accessibleNodes = getAccessibleNodes(pos.y, pos.x);
+      if (currentDirection == NORTH) {
+      if (accessibleNodes & (1 << 0)) { // North///
+        temp = getNextCell(pos, NORTH);
+        if (temp.y != -1 && temp.x != -1) {
+          minhuristic = mazevalues[temp.y][temp.x];
+          nextMove = temp;
+          Serial.print("north : (");
+          Serial.print(temp.y);
+          Serial.print(", ");
+          Serial.print(temp.x);
+          Serial.println(")");
+        }
+      }
+    
+
+      if (accessibleNodes & (1 << 1)) { // EAST
+        temp = getNextCell(pos, EAST);
+          if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+            if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+              minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+              nextMove = temp;  // Update nextMove to the new valid position
+              Serial.print("east : (");
+              Serial.print(temp.y);
+              Serial.print(", ");
+              Serial.print(temp.x);
+              Serial.println(")");
+            }   
+          }
+      }
+
+      if (accessibleNodes & (1 << 2)) { // SOUTH
+        temp = getNextCell(pos, SOUTH);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("south : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+
+      if (accessibleNodes & (1 << 3)) { // WEST
+        temp = getNextCell(pos, WEST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+              Serial.print("west : (");
+              Serial.print(temp.y);
+              Serial.print(", ");
+              Serial.print(temp.x);
+              Serial.println(")");
+          }
+        }
+      }
+    
+    }else if (currentDirection == EAST) {
+
+      if (accessibleNodes & (1 << 3)) { // WEST
+        temp = getNextCell(pos, WEST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("west : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }  
+      }
+
+      if (accessibleNodes & (1 << 0)) { // North///
+        temp = getNextCell(pos, NORTH);
+        if (temp.y != -1 && temp.x != -1) {
+          if (mazevalues[temp.y][temp.x] < minhuristic) {
+            minhuristic = mazevalues[temp.y][temp.x];
+            nextMove = temp;
+            Serial.print("north : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+      if (accessibleNodes & (1 << 1)) { // EAST
+        temp = getNextCell(pos, EAST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("east : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+      if (accessibleNodes & (1 << 2)) { // SOUTH
+        temp = getNextCell(pos, SOUTH);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("south : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+    }
+
+    else if (currentDirection == WEST)
+    {
+
+      if (accessibleNodes & (1 << 1)) { // EAST
+        temp = getNextCell(pos, EAST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("east : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+        }
+      }
+
+       
+      if (accessibleNodes & (1 << 2)) { // SOUTH
+        temp = getNextCell(pos, SOUTH);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("south : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+      if (accessibleNodes & (1 << 3)) { // WEST
+        temp = getNextCell(pos, WEST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("west : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+      if (accessibleNodes & (1 << 0)) { // North///
+        temp = getNextCell(pos, NORTH);
+        if (temp.y != -1 && temp.x != -1) {
+          if (mazevalues[temp.y][temp.x] < minhuristic) { 
+            minhuristic = mazevalues[temp.y][temp.x];
+            nextMove = temp;
+            Serial.print("north : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+    } 
+    else if (currentDirection == SOUTH) {
+      if (accessibleNodes & (1 << 2)) { // SOUTH
+        temp = getNextCell(pos, SOUTH);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("south : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+        }
+      }
+
+      if (accessibleNodes & (1 << 3)) { // WEST
+        temp = getNextCell(pos, WEST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("west : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+      if (accessibleNodes & (1 << 0)) { // North///
+        temp = getNextCell(pos, NORTH);
+        if (temp.y != -1 && temp.x != -1) {
+          if (mazevalues[temp.y][temp.x] < minhuristic) {
+            minhuristic = mazevalues[temp.y][temp.x];
+            nextMove = temp;
+            Serial.print("north : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+      }
+
+    
+      if (accessibleNodes & (1 << 1)) { // EAST
+        temp = getNextCell(pos, EAST);
+        if (temp.y != -1 && temp.x != -1) {  // Check if the position is valid
+          if (mazevalues[temp.y][temp.x] < minhuristic) {  // Compare with the current minimum heuristic
+            minhuristic = mazevalues[temp.y][temp.x];  // Update the heuristic value
+            nextMove = temp;  // Update nextMove to the new valid position
+            Serial.print("east : (");
+            Serial.print(temp.y);
+            Serial.print(", ");
+            Serial.print(temp.x);
+            Serial.println(")");
+          }
+        }
+       }
+       for (int i = 0; i < mazeSize; i++) {
+        for (int j = 0; j < mazeSize; j++) {
+            Serial.print(mazevalues[i][j]);
+            Serial.print("\t"); // Use tab for better formatting
+        }
+        Serial.println(); // New line for next row
+      }
+
+    }
+        
+
+   
+    }
+
+    Serial.print("nextmove: (");
+    Serial.print(nextMove.y);
+    Serial.print(", ");
+    Serial.print(nextMove.x);
+    Serial.println(")");
+
+    
+    
+
+    // Movement logic based on the next move (no changes here)
+    if (nextMove.x > pos.x) {
+        if (currentDirection == NORTH) {
+            Serial.println("nextMove.x > pos.x");
+            turnRight();
+            delay(1000);
+            moveForward(8,400);
+            delay(1000);
+            currentDirection = EAST;
+        } else if (currentDirection == SOUTH) {
+            currentDirection = EAST;
+            turnLeft();
+            delay(1000);
+            moveForward(8,400);
+            delay(1000);
+            Serial.println("nextMove.x > pos.x");
+        } else if (currentDirection == EAST) {
+            currentDirection = EAST;
+            moveForward(25,800);
+            delay(1000);
+            Serial.println("nextMove.x > pos.x");
+        } else if (currentDirection == WEST) {
+            currentDirection = EAST;  
+            uTurn(150, 150, 500);
+            delay(1000);
+            moveForward(8,400);
+            delay(1000);
+            Serial.println("nextMove.x > pos.x");
+        }
+    } else if (nextMove.x < pos.x) {
+        if (currentDirection == NORTH) {
+            currentDirection = WEST;
+            turnLeft();
+            delay(1000);
+            Serial.println("nextMove.x < pos.x");
+            moveForward(8,400);
+            delay(1000);
+        } else if (currentDirection == SOUTH) {
+            currentDirection = WEST;
+            Serial.println("nextMove.x < pos.x");
+            turnRight();
+            delay(1000);
+            moveForward(8,400);
+            delay(1000);
+        } else if (currentDirection == EAST) {
+            currentDirection = WEST;
+            Serial.println("nextMove.x < pos.x");
+            uTurn(150, 150, 500);
+            delay(1000);
+            moveForward(8,400);
+            delay(1000);
+        } else if (currentDirection == WEST) {
+            currentDirection = WEST;  
+            Serial.println("nextMove.x < pos.x");
+            moveForward(25,800);
+            delay(1000);
+        }
+    } else if (nextMove.y > pos.y) {
+        if (currentDirection == NORTH) {
+            currentDirection = SOUTH;
+            uTurn(150, 150, 500);
+            delay(1000);
+            Serial.println("nextMove.y > pos.y");
+            moveForward(8,400);
+            delay(1000);
+        } else if (currentDirection == SOUTH) {
+            currentDirection = SOUTH;
+            Serial.println("nextMove.y > pos.y");
+            moveForward(25,800);
+            delay(1000);
+        } else if (currentDirection == EAST) {
+            currentDirection = SOUTH;
+            turnRight();
+            delay(1000);
+            Serial.println("nextMove.y > pos.y");
+            moveForward(8,400);
+            delay(1000);
+        } else if (currentDirection == WEST) {
+            currentDirection = SOUTH;  
+            turnLeft();
+            delay(1000);
+            Serial.println("nextMove.y > pos.y");
+           moveForward(8,400);
+            delay(1000);
+        }
+    } else if (nextMove.y < pos.y) {
+        if (currentDirection == NORTH) {
+            currentDirection = NORTH;
+            Serial.println("nextMove.y < pos.y");
+            moveForward(25,800);
+            delay(1000);
+        } else if (currentDirection == SOUTH) {
+            currentDirection = NORTH;
+            uTurn(150, 150, 500);
+            delay(1000);
+            Serial.println("nextMove.y < pos.y");
+            moveForward(8,400);
+            delay(1000);
+        } else if (currentDirection == EAST) {
+            currentDirection = NORTH;
+            turnLeft();
+            delay(1000);
+            Serial.println("nextMove.y < pos.y");
+            moveForward(8,400); 
+            delay(1000);
+        } else if (currentDirection == WEST) {
+            currentDirection = NORTH;  
+            turnRight();
+            delay(1000);
+            Serial.println("nextMove.y < pos.y");
+            moveForward(8,400);
+            delay(1000);
+        }
+    }
+        currentposition = nextMove; 
+        return; 
+    
+    
+}
+
+
+void setup() {
+
+  Serial.begin(115200);
+  Serial.println("Starting Floodfill Navigation...");
+  Wire.begin();  // Start I2C communication
+  
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+  delay(1000);  // Wait for sensors to stabilize
+
+  // Initialize LiDAR and other components
+  lidar.init();
+  lidar.setTimeout(500);
+
+  mpu.initialize();
+
+  // Calibrate gyro and other initializations
+  calculateGyroDrift();
+  
+  // Initialize motors only after other components are set
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  readRightIRsensor();
+  readLeftIRsensor();
+}
+
+void loop() {
+    delay(1000);
+    if (mazevalues[currentposition.y][currentposition.x] == 0) return;
+    floodfill(currentposition);
+    visited[currentposition.y][currentposition.x] = 1;  // Mark visited only after a successful move
+    Serial.print("Current Position: (");
+    Serial.print(currentposition.y);
+    Serial.print(", ");
+    Serial.print(currentposition.x);
+    Serial.println(")");
+    Serial.println("current direction");
+    Serial.println(currentDirection);
+
+  
+}
